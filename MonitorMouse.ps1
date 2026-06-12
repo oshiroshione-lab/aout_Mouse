@@ -75,10 +75,15 @@ namespace MonitorMouseDaemon {
     static extern bool SetProcessDpiAwarenessContext(IntPtr value);
     [DllImport("user32.dll")]
     static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")]
+    static extern short GetAsyncKeyState(int vKey);
 
     const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
     const uint WINEVENT_OUTOFCONTEXT = 0x0000;
     const uint MONITOR_DEFAULTTONEAREST = 0x00000002;
+    const int VK_LBUTTON = 0x01;
+    const int VK_RBUTTON = 0x02;
+    const int VK_MBUTTON = 0x04;
     static readonly IntPtr DPI_PER_MONITOR_V2 = new IntPtr(-4);
 
     static WinEventDelegate _proc;     // GC で回収されないよう保持
@@ -97,15 +102,17 @@ namespace MonitorMouseDaemon {
       if (hwnd == _lastHwnd) return;             // 同一ウィンドウへの重複イベントは無視
       _lastHwnd = hwnd;
 
+      // マウスボタンが押されている＝クリックでフォーカスを移した場合は動かさない
+      // （Alt+Tab / Ctrl+Tab 等のキーボード切替時のみ中心へ移動する）
+      if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) return;
+      if ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0) return;
+      if ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0) return;
+
       IntPtr targetMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
       if (targetMon == IntPtr.Zero) return;
 
-      POINT cur;
-      if (!GetCursorPos(out cur)) return;
-      IntPtr curMon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
-
-      if (targetMon == curMon) return; // 既に同じモニターに居る場合は動かさない
-
+      // キーボード切替時は、切替先ウィンドウが乗るモニターの中心へ常に移動
+      // （カーソルが既に同じモニターに居ても中心へ寄せ直す）
       MONITORINFO mi = new MONITORINFO();
       mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
       if (!GetMonitorInfo(targetMon, ref mi)) return;
