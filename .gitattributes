@@ -1,0 +1,6 @@
+# WSH (wscript.exe) は .vbs をシステムの ANSI コードページ（日本語環境では
+# Shift-JIS）として読み込む。BOM 無し UTF-8 で日本語コメントを書くと文字化けし、
+# ランチャーが powershell を起動できず常駐が立ち上がらない。
+# そのため .vbs は作業ツリー上では UTF-16LE+BOM（WSH が正式サポートする Unicode 形式）
+# として扱い、リポジトリ内部は UTF-8 で保存する（差分が読める）。
+*.vbs text working-tree-encoding=UTF-16LE-BOM eol=CRLF
