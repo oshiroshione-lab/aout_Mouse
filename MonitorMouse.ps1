@@ -13,6 +13,12 @@
 
   - 切替UI(Task View / Alt+Tab オーバーレイ)のウィンドウクラスは無視する。
   - マウスボタンでフォーカスした場合(クリック)は移動しない。
+  - カーソルが既に切替先ウィンドウと同じモニター上にある場合は移動しない。
+    これにより「隠れているインジケーターを表示します」やトレイのミニアプリ
+    (monitorian 等)のフライアウトを開いてもカーソルが飛ばない。
+  - スリープ/画面ロックからの復帰直後は一定時間カーソル移動を抑制する。
+    復帰時に発生するディスプレイ再構成・前面ウィンドウ復元のフォアグラウンド
+    イベントでカーソルが勝手に中央へ飛ぶのを防ぐ。
   - 外部モニター接続時(画面が2台以上)のみ動作する。単一画面のときは
     何もしない(実質オフ)。接続/切断は切り替えごとに毎回判定するため、
     デーモンを再起動せずとも即座に反映される。
@@ -38,6 +44,7 @@ namespace MonitorMouseDaemon {
   public static class Hook {
     delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
         int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
+    delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll")]
     static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc,
@@ -61,6 +68,19 @@ namespace MonitorMouseDaemon {
       public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam;
       public uint time; public POINT pt;
     }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct WNDCLASS {
+      public uint style;
+      public IntPtr lpfnWndProc;
+      public int cbClsExtra;
+      public int cbWndExtra;
+      public IntPtr hInstance;
+      public IntPtr hIcon;
+      public IntPtr hCursor;
+      public IntPtr hbrBackground;
+      [MarshalAs(UnmanagedType.LPWStr)] public string lpszMenuName;
+      [MarshalAs(UnmanagedType.LPWStr)] public string lpszClassName;
+    }
 
     delegate bool MonitorEnumDelegate(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
 
@@ -68,6 +88,10 @@ namespace MonitorMouseDaemon {
     static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")]
     static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+    [DllImport("user32.dll")]
+    static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
+    [DllImport("user32.dll")]
+    static extern bool GetCursorPos(out POINT lpPoint);
     [DllImport("user32.dll")]
     static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
     [DllImport("user32.dll")]
@@ -90,6 +114,24 @@ namespace MonitorMouseDaemon {
     [DllImport("user32.dll")]
     static extern bool KillTimer(IntPtr hWnd, UIntPtr uIDEvent);
 
+    // 非表示ウィンドウ(電源/セッション通知の受信先・settle タイマーの宿主)
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern ushort RegisterClassW(ref WNDCLASS lpWndClass);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateWindowExW(uint dwExStyle, string lpClassName, string lpWindowName,
+        uint dwStyle, int x, int y, int nWidth, int nHeight, IntPtr hWndParent, IntPtr hMenu,
+        IntPtr hInstance, IntPtr lpParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr DefWindowProcW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr GetModuleHandleW(string lpModuleName);
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    static extern bool WTSRegisterSessionNotification(IntPtr hWnd, uint dwFlags);
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    static extern bool WTSUnRegisterSessionNotification(IntPtr hWnd);
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern IntPtr RegisterSuspendResumeNotification(IntPtr hRecipient, uint flags);
+
     [DllImport("user32.dll")]
     static extern bool SetProcessDpiAwarenessContext(IntPtr value);
     [DllImport("user32.dll")]
@@ -99,18 +141,39 @@ namespace MonitorMouseDaemon {
     const uint WINEVENT_OUTOFCONTEXT = 0x0000;
     const uint MONITOR_DEFAULTTONEAREST = 0x00000002;
     const uint WM_TIMER = 0x0113;
-    const uint SETTLE_MS = 120;   // 連続イベントが落ち着くまでの待機(ミリ秒)
+    const uint WM_WTSSESSION_CHANGE = 0x02B1;
+    const uint WM_POWERBROADCAST = 0x0218;
+    const uint SETTLE_MS = 120;        // 連続イベントが落ち着くまでの待機(ミリ秒)
+    const int RESUME_GRACE_MS = 3000;  // 復帰直後にカーソル移動を抑制する時間(ミリ秒)
     const int VK_LBUTTON = 0x01;
     const int VK_RBUTTON = 0x02;
     const int VK_MBUTTON = 0x04;
-    static readonly IntPtr DPI_PER_MONITOR_V2 = new IntPtr(-4);
 
-    static WinEventDelegate _proc;     // GC で回収されないよう保持
+    // WTS セッション変化イベント
+    const int WTS_SESSION_LOGON = 0x5;
+    const int WTS_SESSION_LOGOFF = 0x6;
+    const int WTS_SESSION_LOCK = 0x7;
+    const int WTS_SESSION_UNLOCK = 0x8;
+    const uint NOTIFY_FOR_THIS_SESSION = 0;
+    // 電源(サスペンド/復帰)イベント
+    const int PBT_APMSUSPEND = 0x0004;
+    const int PBT_APMRESUMESUSPEND = 0x0007;
+    const int PBT_APMRESUMEAUTOMATIC = 0x0012;
+    const uint DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000;
+
+    static readonly IntPtr DPI_PER_MONITOR_V2 = new IntPtr(-4);
+    static readonly UIntPtr TIMER_ID = new UIntPtr(1);
+
+    static WinEventDelegate _proc;         // GC で回収されないよう保持
+    static WndProcDelegate _wndProc;       // 同上(ウィンドウプロシージャ)
     static MonitorEnumDelegate _countProc; // 同上(モニター列挙コールバック)
     static IntPtr _hook = IntPtr.Zero;
-    static UIntPtr _timer = UIntPtr.Zero;
+    static IntPtr _hwnd = IntPtr.Zero;
+    static bool _armed = false;            // settle タイマー設定中か
     static bool _clickDuringBurst = false;
-    static int _monitorCount = 0;      // CountMonitors 用の一時カウンタ(メッセージループ専用スレッド)
+    static bool _locked = false;           // 画面ロック/サスペンド中か
+    static int _suppressUntil = 0;         // この TickCount まで移動を抑制(復帰直後など)
+    static int _monitorCount = 0;          // CountMonitors 用の一時カウンタ
 
     static void SetDpiAwareness() {
       try { if (SetProcessDpiAwarenessContext(DPI_PER_MONITOR_V2)) return; } catch {}
@@ -121,6 +184,19 @@ namespace MonitorMouseDaemon {
       return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0
           || (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0
           || (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+    }
+
+    // 復帰直後の抑制期間中か(TickCount のラップアラウンドに耐える符号付き差分比較)
+    static bool Suppressed() {
+      return (Environment.TickCount - _suppressUntil) < 0;
+    }
+
+    static void Suppress(int ms) {
+      _suppressUntil = Environment.TickCount + ms;
+    }
+
+    static void CancelTimer() {
+      if (_armed) { KillTimer(_hwnd, TIMER_ID); _armed = false; }
     }
 
     // 接続中のモニター台数を数える。EnumDisplayMonitors は同期呼び出しのため
@@ -154,11 +230,12 @@ namespace MonitorMouseDaemon {
         int idObject, int idChild, uint dwEventThread, uint dwmsEventTime) {
       if (hwnd == IntPtr.Zero) return;
       if (idObject != 0 || idChild != 0) return; // OBJID_WINDOW / CHILDID_SELF のみ
+      if (_locked || Suppressed()) return;        // ロック中・復帰直後は何もしない
 
       if (AnyMouseButtonDown()) _clickDuringBurst = true; // クリック由来のフォーカスを記録
 
-      if (_timer != UIntPtr.Zero) { KillTimer(IntPtr.Zero, _timer); _timer = UIntPtr.Zero; }
-      _timer = SetTimer(IntPtr.Zero, UIntPtr.Zero, SETTLE_MS, IntPtr.Zero);
+      CancelTimer();
+      if (SetTimer(_hwnd, TIMER_ID, SETTLE_MS, IntPtr.Zero) != UIntPtr.Zero) _armed = true;
     }
 
     // settle 経過後に一度だけ呼ばれ、最終的な前面ウィンドウのモニター中心へ移動
@@ -166,15 +243,22 @@ namespace MonitorMouseDaemon {
       bool click = _clickDuringBurst;
       _clickDuringBurst = false; // 次のバーストに向けてリセット
 
-      if (CountMonitors() < 2) return; // 外部モニター未接続(単一画面)では動作しない
+      if (_locked || Suppressed()) return;             // ロック中・復帰直後は移動しない
+      if (CountMonitors() < 2) return;                 // 外部モニター未接続(単一画面)では動作しない
 
       IntPtr hwnd = GetForegroundWindow();
       if (hwnd == IntPtr.Zero) return;
-      if (IsSwitcherWindow(hwnd)) return;          // 切替UIが前面なら何もしない(後で本ウィンドウが来る)
-      if (click || AnyMouseButtonDown()) return;   // クリック操作では動かさない
+      if (IsSwitcherWindow(hwnd)) return;              // 切替UIが前面なら何もしない(後で本ウィンドウが来る)
+      if (click || AnyMouseButtonDown()) return;       // クリック操作では動かさない
 
       IntPtr mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
       if (mon == IntPtr.Zero) return;
+
+      // カーソルが既に切替先ウィンドウと同じモニター上にいるなら動かさない。
+      // トレイのフライアウト(隠れているインジケーター / monitorian 等)は
+      // クリックしたモニター上に開くため、これで余計な移動を防ぐ。
+      POINT cp;
+      if (GetCursorPos(out cp) && MonitorFromPoint(cp, MONITOR_DEFAULTTONEAREST) == mon) return;
 
       MONITORINFO mi = new MONITORINFO();
       mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
@@ -185,8 +269,56 @@ namespace MonitorMouseDaemon {
       SetCursorPos(cx, cy);
     }
 
+    // 非表示ウィンドウのプロシージャ: タイマー満了・電源・セッション変化を処理
+    static IntPtr WndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam) {
+      if (msg == WM_TIMER) {
+        CancelTimer();
+        OnSettle();
+        return IntPtr.Zero;
+      }
+      if (msg == WM_WTSSESSION_CHANGE) {
+        int e = wParam.ToInt32();
+        if (e == WTS_SESSION_LOCK) {
+          _locked = true; CancelTimer();
+        } else if (e == WTS_SESSION_UNLOCK || e == WTS_SESSION_LOGON) {
+          _locked = false; Suppress(RESUME_GRACE_MS); CancelTimer();
+        } else if (e == WTS_SESSION_LOGOFF) {
+          _locked = true; CancelTimer();
+        }
+        return IntPtr.Zero;
+      }
+      if (msg == WM_POWERBROADCAST) {
+        int ev = wParam.ToInt32();
+        if (ev == PBT_APMSUSPEND) {
+          Suppress(RESUME_GRACE_MS); CancelTimer();
+        } else if (ev == PBT_APMRESUMEAUTOMATIC || ev == PBT_APMRESUMESUSPEND) {
+          Suppress(RESUME_GRACE_MS); CancelTimer();
+        }
+        return new IntPtr(1); // TRUE
+      }
+      return DefWindowProcW(hWnd, msg, wParam, lParam);
+    }
+
     public static void Run() {
       SetDpiAwareness();
+
+      // 通知受信用の非表示ウィンドウを作成(トップレベル・非表示のまま)
+      _wndProc = new WndProcDelegate(WndProc);
+      WNDCLASS wc = new WNDCLASS();
+      wc.lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProc);
+      wc.hInstance = GetModuleHandleW(null);
+      wc.lpszClassName = "MonitorMouseHiddenWnd";
+      if (RegisterClassW(ref wc) == 0)
+        throw new Exception("RegisterClassW failed: " + Marshal.GetLastWin32Error());
+      _hwnd = CreateWindowExW(0, wc.lpszClassName, "MonitorMouse", 0, 0, 0, 0, 0,
+          IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
+      if (_hwnd == IntPtr.Zero)
+        throw new Exception("CreateWindowExW failed: " + Marshal.GetLastWin32Error());
+
+      // ロック/アンロック・サスペンド/復帰の通知を受け取る(失敗は致命的ではない)
+      WTSRegisterSessionNotification(_hwnd, NOTIFY_FOR_THIS_SESSION);
+      RegisterSuspendResumeNotification(_hwnd, DEVICE_NOTIFY_WINDOW_HANDLE);
+
       _proc = new WinEventDelegate(OnForeground);
       _hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
           IntPtr.Zero, _proc, 0, 0, WINEVENT_OUTOFCONTEXT);
@@ -196,15 +328,11 @@ namespace MonitorMouseDaemon {
       int ret;
       while ((ret = GetMessage(out msg, IntPtr.Zero, 0, 0)) != 0) {
         if (ret == -1) break;
-        if (msg.message == WM_TIMER) {
-          if (_timer != UIntPtr.Zero) { KillTimer(IntPtr.Zero, _timer); _timer = UIntPtr.Zero; }
-          OnSettle();
-          continue;
-        }
         TranslateMessage(ref msg);
         DispatchMessage(ref msg);
       }
       UnhookWinEvent(_hook);
+      WTSUnRegisterSessionNotification(_hwnd);
     }
   }
 }
