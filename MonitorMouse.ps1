@@ -19,6 +19,10 @@
   - スリープ/画面ロックからの復帰直後は一定時間カーソル移動を抑制する。
     復帰時に発生するディスプレイ再構成・前面ウィンドウ復元のフォアグラウンド
     イベントでカーソルが勝手に中央へ飛ぶのを防ぐ。
+  - スクリーンショットツール(Snipping Tool 等)のウィンドウが前面のときは移動しない。
+    キャプチャのオーバーレイはメインモニターに前面表示されるため、これを除外しないと
+    サブモニター上の範囲選択がメイン画面へ引き戻されてしまう。前面ウィンドウの所属
+    プロセス名で判定するので、ショートカット(Win+Shift+S 等)や起動方法に依存しない。
   - 外部モニター接続時(画面が2台以上)のみ動作する。単一画面のときは
     何もしない(実質オフ)。接続/切断は切り替えごとに毎回判定するため、
     デーモンを再起動せずとも即座に反映される。
@@ -103,6 +107,16 @@ namespace MonitorMouseDaemon {
     [DllImport("user32.dll")]
     static extern short GetAsyncKeyState(int vKey);
 
+    // 前面ウィンドウの所属プロセス(スクショツールか)を判定するための問い合わせ用
+    [DllImport("user32.dll")]
+    static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr hObject);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool QueryFullProcessImageNameW(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref uint lpdwSize);
+
     [DllImport("user32.dll")]
     static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
     [DllImport("user32.dll")]
@@ -148,6 +162,15 @@ namespace MonitorMouseDaemon {
     const int VK_LBUTTON = 0x01;
     const int VK_RBUTTON = 0x02;
     const int VK_MBUTTON = 0x04;
+    const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
+    // スクリーンショットツールの実行ファイル名。前面ウィンドウがこれらに属する場合は
+    // キャプチャのオーバーレイ/編集ウィンドウとみなし、カーソルを動かさない。
+    // ショートカット(Win+Shift+S 等)が何であっても・どう起動しても効く。
+    static readonly string[] SCREENSHOT_PROCS = new string[] {
+      "SnippingTool.exe",  // Windows 11 Snipping Tool(切り取り領域とスケッチ統合後)
+      "ScreenSketch.exe",  // 旧「切り取り & スケッチ」
+    };
 
     // WTS セッション変化イベント
     const int WTS_SESSION_LOGON = 0x5;
@@ -184,6 +207,31 @@ namespace MonitorMouseDaemon {
       return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0
           || (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0
           || (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+    }
+
+    // 前面ウィンドウがスクリーンショットツールに属するか。Snipping Tool の
+    // キャプチャオーバーレイはメインモニターに前面表示されるため、これを除外しないと
+    // カーソルがメイン画面中央へ飛んで範囲選択を妨げてしまう。所属プロセスの実行ファイル名で
+    // 判定するので、起動方法やショートカット(Win+Shift+S 等)に依存しない。
+    static bool IsScreenshotTool(IntPtr hwnd) {
+      uint pid;
+      GetWindowThreadProcessId(hwnd, out pid);
+      if (pid == 0) return false;
+      IntPtr h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+      if (h == IntPtr.Zero) return false;
+      try {
+        var sb = new StringBuilder(1024);
+        uint sz = (uint)sb.Capacity;
+        if (!QueryFullProcessImageNameW(h, 0, sb, ref sz)) return false;
+        string path = sb.ToString();
+        int slash = path.LastIndexOf('\\');
+        string name = (slash >= 0) ? path.Substring(slash + 1) : path;
+        foreach (string p in SCREENSHOT_PROCS)
+          if (string.Equals(name, p, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+      } finally {
+        CloseHandle(h);
+      }
     }
 
     // 復帰直後の抑制期間中か(TickCount のラップアラウンドに耐える符号付き差分比較)
@@ -249,6 +297,7 @@ namespace MonitorMouseDaemon {
       IntPtr hwnd = GetForegroundWindow();
       if (hwnd == IntPtr.Zero) return;
       if (IsSwitcherWindow(hwnd)) return;              // 切替UIが前面なら何もしない(後で本ウィンドウが来る)
+      if (IsScreenshotTool(hwnd)) return;              // スクショ(Snipping Tool 等)のキャプチャ/編集中は動かさない
       if (click || AnyMouseButtonDown()) return;       // クリック操作では動かさない
 
       IntPtr mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
